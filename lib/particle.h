@@ -43,9 +43,11 @@ struct color4f {
 struct particle {
 	struct point pos;
 	struct point startPos;
+	struct matrix emitMatrix;
 
 	struct color4f color;
 	struct color4f deltaColor;
+	uint32_t color_val;
 
 	float size;
 	float deltaSize;
@@ -125,8 +127,12 @@ struct particle_config {
 	// color modulate
 	//    BOOL colorModulate;
 
+	int srcBlend;
+	int dstBlend;
+
 	/** How many seconds the emitter will run. -1 means 'forever' */
 	float duration;
+	struct matrix* emitterMatrix;
 	/** sourcePosition of the emitter */
 	struct point sourcePosition;
 	/** Position variance of the emitter */

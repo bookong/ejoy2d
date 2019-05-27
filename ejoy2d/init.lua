@@ -2,8 +2,10 @@ local shader = require "ejoy2d.shader"
 local fw = require "ejoy2d.framework"
 
 function fw.EJOY2D_INIT()
-	shader.init()
+--	shader.init()
 end
+
+shader.init()
 
 local ejoy2d = {}
 
@@ -34,11 +36,17 @@ function ejoy2d.start(callback)
 	end
 	fw.EJOY2D_MESSAGE = assert(callback.message)
   	fw.EJOY2D_HANDLE_ERROR = assert(callback.handle_error)
+  	fw.EJOY2D_RESUME = assert(callback.on_resume)
+		fw.EJOY2D_PAUSE = assert(callback.on_pause)
 	fw.inject()
 end
 
 function ejoy2d.clear(color)
 	return shader.clear(color)
+end
+
+function ejoy2d.define_shader(args)
+	return shader.define(args)
 end
 
 return ejoy2d

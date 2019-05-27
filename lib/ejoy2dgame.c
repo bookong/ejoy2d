@@ -14,6 +14,8 @@
 #include "lmatrix.h"
 #include "label.h"
 #include "particle.h"
+#include "lrenderbuffer.h"
+#include "lgeometry.h"
 
 //#define LOGIC_FRAME 30
 
@@ -24,6 +26,8 @@
 #define EJOY_GESTURE "EJOY2D_GESTURE"
 #define EJOY_MESSAGE "EJOY2D_MESSAGE"
 #define EJOY_HANDLE_ERROR "EJOY2D_HANDLE_ERROR"
+#define EJOY_RESUME "EJOY2D_RESUME"
+#define EJOY_PAUSE "EJOY2D_PAUSE"
 
 #define TRACEBACK_FUNCTION 1
 #define UPDATE_FUNCTION 2
@@ -31,12 +35,6 @@
 #define TOP_FUNCTION 3
 
 static int LOGIC_FRAME = 30;
-
-struct game {
-	lua_State *L;
-	float real_time;
-	float logic_time;
-};
 
 static int
 _panic(lua_State *L) {
@@ -55,6 +53,8 @@ linject(lua_State *L) {
 		EJOY_GESTURE,
 		EJOY_MESSAGE,
 		EJOY_HANDLE_ERROR,
+		EJOY_RESUME,
+		EJOY_PAUSE,
 	};
 	int i;
 	for (i=0;i<sizeof(ejoy_callback)/sizeof(ejoy_callback[0]);i++) {
@@ -89,47 +89,76 @@ checkluaversion(lua_State *L) {
 			LUA_VERSION_NUM, *v);
 	}
 }
-
+#if __ANDROID__
+#define OS_STRING "ANDROID"
+#else
 #define STR_VALUE(arg)	#arg
 #define _OS_STRING(name) STR_VALUE(name)
 #define OS_STRING _OS_STRING(EJOY2D_OS)
+#endif
 
-struct game *
-ejoy2d_game() {
-	struct game *G = (struct game *)malloc(sizeof(*G));
+lua_State *
+ejoy2d_lua_init() {
 	lua_State *L = luaL_newstate();
+	
+	lua_atpanic(L, _panic);
+	luaL_openlibs(L);
+	return L;
+}
+
+void
+ejoy2d_init(lua_State *L) {
 	checkluaversion(L);
 	lua_pushliteral(L, OS_STRING);
 	lua_setglobal(L , "OS");
 
-	G->L = L;
-	G->real_time = 0;
-	G->logic_time = 0;
-	lua_atpanic(L, _panic);
-	luaL_openlibs(L);
 	luaL_requiref(L, "ejoy2d.shader.c", ejoy2d_shader, 0);
 	luaL_requiref(L, "ejoy2d.framework", ejoy2d_framework, 0);
 	luaL_requiref(L, "ejoy2d.ppm", ejoy2d_ppm, 0);
 	luaL_requiref(L, "ejoy2d.spritepack.c", ejoy2d_spritepack, 0);
 	luaL_requiref(L, "ejoy2d.sprite.c", ejoy2d_sprite, 0);
+	luaL_requiref(L, "ejoy2d.renderbuffer", ejoy2d_renderbuffer, 0);
 	luaL_requiref(L, "ejoy2d.matrix.c", ejoy2d_matrix, 0);
 	luaL_requiref(L, "ejoy2d.particle.c", ejoy2d_particle, 0);
+	luaL_requiref(L, "ejoy2d.geometry.c", ejoy2d_geometry, 0);
 
 	lua_settop(L,0);
 
 	shader_init();
 	label_load();
+}
+
+struct game *
+ejoy2d_game() {
+	struct game *G = (struct game *)malloc(sizeof(*G));
+	lua_State *L = ejoy2d_lua_init();
+
+	G->L = L;
+	G->real_time = 0;
+	G->logic_time = 0;
+
+	ejoy2d_init(L);
 
 	return G;
 }
 
 void
+ejoy2d_close_lua(struct game *G) {
+	if (G) {
+		if (G->L) {
+			lua_close(G->L);
+			G->L = NULL;
+		}
+		free(G);
+	}
+}
+
+void
 ejoy2d_game_exit(struct game *G) {
+	ejoy2d_close_lua(G);
 	label_unload();
 	texture_exit();
 	shader_unload();
-	lua_close(G->L);
-	free(G);
 }
 
 lua_State *
@@ -138,14 +167,17 @@ ejoy2d_game_lua(struct game *G) {
 }
 
 static int
-traceback (lua_State *L) {
+traceback(lua_State *L) {
 	const char *msg = lua_tostring(L, 1);
-	if (msg)
-		luaL_traceback(L, L, msg, 1);
-	else if (!lua_isnoneornil(L, 1)) {
-	if (!luaL_callmeta(L, 1, "__tostring"))
-		lua_pushliteral(L, "(no error message)");
+	if (msg == NULL) {
+	if (luaL_callmeta(L, 1, "__tostring") &&
+		lua_type(L, -1) == LUA_TSTRING)
+		return 1; 
+	else
+		msg = lua_pushfstring(L, "(error object is a %s value)",
+								luaL_typename(L, 1));
 	}
+	luaL_traceback(L, L, msg, 1); 
 	return 1;
 }
 
@@ -165,6 +197,8 @@ ejoy2d_game_start(struct game *G) {
 	lua_getfield(L,LUA_REGISTRYINDEX, EJOY_UPDATE);
 	lua_getfield(L,LUA_REGISTRYINDEX, EJOY_DRAWFRAME);
 	lua_getfield(L,LUA_REGISTRYINDEX, EJOY_MESSAGE);
+  lua_getfield(L,LUA_REGISTRYINDEX, EJOY_RESUME);
+	lua_getfield(L, LUA_REGISTRYINDEX, EJOY_PAUSE);
 }
 
 
@@ -225,6 +259,12 @@ call(lua_State *L, int n, int r) {
 	return err;
 }
 
+void
+ejoy2d_call_lua(lua_State *L, int n, int r) {
+  call(L, n, r);
+	lua_settop(L, TOP_FUNCTION);
+}
+
 static void
 logic_frame(lua_State *L) {
 	lua_pushvalue(L, UPDATE_FUNCTION);
@@ -247,11 +287,14 @@ ejoy2d_game_update(struct game *G, float time) {
 
 void
 ejoy2d_game_drawframe(struct game *G) {
+	reset_drawcall_count();
 	lua_pushvalue(G->L, DRAWFRAME_FUNCTION);
 	call(G->L, 0, 0);
 	lua_settop(G->L, TOP_FUNCTION);
 	shader_flush();
 	label_flush();
+	//int cnt = drawcall_count();
+	//printf("-> %d\n", cnt);
 }
 
 int
@@ -263,10 +306,11 @@ ejoy2d_game_touch(struct game *G, int id, float x, float y, int status) {
 	lua_pushinteger(G->L, status+1);
 	lua_pushinteger(G->L, id);
 	int err = call(G->L, 4, 1);
-    if (err == LUA_OK) {
-        disable_gesture = lua_toboolean(G->L, -1);
-    }
-    return disable_gesture;
+  if (err == LUA_OK) {
+      disable_gesture = lua_toboolean(G->L, -1);
+  }
+  lua_settop(G->L, TOP_FUNCTION);
+  return disable_gesture;
 }
 
 void
@@ -280,15 +324,34 @@ ejoy2d_game_gesture(struct game *G, int type,
     lua_pushnumber(G->L, y2);
     lua_pushinteger(G->L, s);
     call(G->L, 6, 0);
+    lua_settop(G->L, TOP_FUNCTION);
 }
 
 void
-ejoy2d_game_message(struct game* G,int id_, const char* state, const char* data) {
+ejoy2d_game_message(struct game* G,int id_, const char* state, const char* data, lua_Number n) {
   lua_State *L = G->L;
   lua_getfield(L, LUA_REGISTRYINDEX, EJOY_MESSAGE);
   lua_pushnumber(L, id_);
   lua_pushstring(L, state);
   lua_pushstring(L, data);
-  call(L, 3, 0);
+	lua_pushnumber(L, n);
+  call(L, 4, 0);
   lua_settop(L, TOP_FUNCTION);
 }
+
+void
+ejoy2d_game_resume(struct game* G){
+    lua_State *L = G->L;
+    lua_getfield(L, LUA_REGISTRYINDEX, EJOY_RESUME);
+    call(L, 0, 0);
+    lua_settop(L, TOP_FUNCTION);
+}
+
+void
+ejoy2d_game_pause(struct game* G) {
+	lua_State *L = G->L;
+	lua_getfield(L, LUA_REGISTRYINDEX, EJOY_PAUSE);
+	call(L, 0, 0);
+	lua_settop(L, TOP_FUNCTION);
+}
+

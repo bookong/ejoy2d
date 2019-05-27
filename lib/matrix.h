@@ -1,7 +1,24 @@
 #ifndef EJOY_2D_MATRIX_H
 #define EJOY_2D_MATRIX_H
 
+#define EJMAT_R_FACTOR (4096.0)
+
 struct matrix {
+	/* The matrix format is :
+	 *
+	 * | m[0] m[1] 0 |
+	 * | m[2] m[3] 0 |
+	 * | m[4] m[5] 1 |
+	 *
+	 * The format of the coordinates of a point is:
+	 *
+	 * | x y 1 |
+	 *
+	 * So, if you want to transform a point p with a matrix m, do:
+	 *
+	 * p * m
+	 *
+	 */
 	int m[6];
 };
 

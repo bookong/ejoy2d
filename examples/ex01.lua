@@ -9,6 +9,7 @@ pack.load {
 
 local obj = ej.sprite("sample","cannon")
 local turret = obj.turret
+
 -- set position (-100,0) scale (0.5)
 obj:ps(-100,0,0.5)
 
@@ -41,6 +42,12 @@ function game.message(...)
 end
 
 function game.handle_error(...)
+end
+
+function game.on_resume()
+end
+
+function game.on_pause()
 end
 
 ej.start(game)

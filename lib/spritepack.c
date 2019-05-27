@@ -1,7 +1,13 @@
 #include "spritepack.h"
 #include "matrix.h"
-#include "shader.h"
 #include "array.h"
+
+#ifndef EXPORT_EP
+
+#include "shader.h"
+#include "texture.h"
+
+#endif // EXPORT_EP
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -14,6 +20,9 @@
 #define TAG_ADDITIVE 4
 #define TAG_MATRIX 8
 #define TAG_TOUCH 16
+#define TAG_MATRIXREF 32
+
+#ifndef EXPORT_EP
 
 struct import_alloc {
 	lua_State *L;
@@ -21,10 +30,15 @@ struct import_alloc {
 	int cap;
 };
 
+#define ialloc(a, s) ialloc_dbg(a, s, __LINE__)
+
 static void *
-ialloc(struct import_alloc *alloc, int size) {
+ialloc_dbg(struct import_alloc *alloc, int size, int line) {
+	if (size <= 0) {
+		return NULL;
+	}
 	if (alloc->cap < size) {
-		luaL_error(alloc->L, "import invalid stream, alloc failed");
+		luaL_error(alloc->L, "import invalid stream, alloc failed on line %d. cap = %d, size = %d", line, alloc->cap, size);
 	}
 	void * ret = alloc->buffer;
 	alloc->buffer += size;
@@ -37,6 +51,9 @@ struct import_stream {
 	struct sprite_pack *pack;
 	const char * stream;
 	size_t size;
+	struct matrix *matrix;
+	int matrix_n;
+	int maxtexture;
 	// for debug
 	int current_id;
 };
@@ -98,6 +115,14 @@ import_color(struct import_stream *is) {
 	return (b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24);
 }
 
+static int
+get_texid(struct import_stream *is, int texid) {
+	if (texid < 0 || texid >= is->maxtexture) {
+		return -1;
+	}
+	return is->pack->tex[texid];
+}
+
 static void
 import_picture(struct import_stream *is) {
 	int n = import_byte(is);
@@ -107,9 +132,12 @@ import_picture(struct import_stream *is) {
 	for (i=0;i<n;i++) {
 		struct pack_quad * q = &pp->rect[i];
 		int texid = import_byte(is);
-		q->texid = is->pack->tex[texid];
-		for (j=0;j<8;j++) {
-			q->texture_coord[j] = import_word(is);
+		q->texid = get_texid(is, texid);
+		for (j=0;j<8;j+=2) {
+			float x = (float)import_word(is);
+			float y = (float)import_word(is);
+			// todo: check the return value
+			texture_coord(q->texid, x, y, &q->texture_coord[j], &q->texture_coord[j+1]);
 		}
 		for (j=0;j<8;j++) {
 			q->screen_coord[j] = import_int32(is);
@@ -120,30 +148,35 @@ import_picture(struct import_stream *is) {
 static void
 import_polygon(struct import_stream *is) {
 	int n = import_byte(is);
-	struct pack_polygon * pp = (struct pack_polygon *)ialloc(is->alloc, SIZEOF_POLYGON + n * SIZEOF_POLY);
+	struct pack_polygon_data * pp = (struct pack_polygon_data *)ialloc(is->alloc, SIZEOF_POLYGON + n * SIZEOF_POLY);
 	pp->n = n;
 	int i,j;
 	for (i=0;i<n;i++) {
-		struct pack_poly * p = &pp->poly[i];
+		struct pack_poly_data * p = &pp->poly[i];
 		int texid = import_byte(is);
-		p->texid = is->pack->tex[texid];
+		p->texid = get_texid(is, texid);
 		p->n = import_byte(is);
-		p->texture_coord = (uint16_t *)ialloc(is->alloc, p->n * 2 * sizeof(uint16_t));
-		p->screen_coord = (int32_t *)ialloc(is->alloc, p->n * 2 * sizeof(uint32_t));
-		for (j=0;j<p->n*2;j++) {
-			p->texture_coord[j] = import_word(is);
+		uv_t * tc = (uv_t *)ialloc(is->alloc, p->n * 2 * sizeof(uv_t));
+		int32_t * sc = (int32_t *)ialloc(is->alloc, p->n * 2 * sizeof(uint32_t));
+		p->texture_coord = POINTER_TO_OFFSET(is->pack, tc);
+		p->screen_coord = POINTER_TO_OFFSET(is->pack, sc);
+		for (j=0;j<p->n*2;j+=2) {
+			float x = (float)import_word(is);
+			float y = (float)import_word(is);
+			// todo: check the return value
+			texture_coord(p->texid, x, y, &tc[j], &tc[j+1]);
 		}
 		for (j=0;j<p->n*2;j++) {
-			p->screen_coord[j] = import_int32(is);
+			sc[j] = import_int32(is);
 		}
 	}
 }
 
-static const char *
+static offset_t
 import_string(struct import_stream *is) {
 	int n = import_byte(is);
 	if (n==255) {
-		return NULL;
+		return 0;
 	}
 	if (is->size < n) {
 		luaL_error(is->alloc->L, "Invalid stream (%d): read string failed", is->current_id);
@@ -154,17 +187,18 @@ import_string(struct import_stream *is) {
 	is->stream += n;
 	is->size -= n;
 
-	return buf;
+	return POINTER_TO_OFFSET(is->pack, buf);
 }
 
 static void
 import_frame(struct pack_frame * pf, struct import_stream *is, int maxc) {
 	int n = import_word(is);
 	int i;
-	pf->part = (struct pack_part *)ialloc(is->alloc, n * SIZEOF_PART);
+	struct pack_part * part = (struct pack_part *)ialloc(is->alloc, n * SIZEOF_PART);
+	pf->part = POINTER_TO_OFFSET(is->pack, part);
 	pf->n = n;
 	for (i=0;i<n;i++) {
-		struct pack_part *pp = &pf->part[i];
+		struct pack_part *pp = &part[i];
 		int tag = import_byte(is);
 		if (tag & TAG_ID) {
 			pp->component_id = import_word(is);
@@ -175,14 +209,21 @@ import_frame(struct pack_frame * pf, struct import_stream *is, int maxc) {
 			luaL_error(is->alloc->L, "Invalid stream (%d): frame part need an id", is->current_id);
 		}
 		if (tag & TAG_MATRIX) {
-			pp->t.mat = (struct matrix *)ialloc(is->alloc, SIZEOF_MATRIX);
-			int32_t *m = pp->t.mat->m;
+			struct matrix *mat = (struct matrix *)ialloc(is->alloc, SIZEOF_MATRIX);
+			pp->t.mat = POINTER_TO_OFFSET(is->pack, mat);
+			int32_t *m = mat->m;
 			int j;
 			for (j=0;j<6;j++) {
 				m[j] = import_int32(is);
 			}
+		} else if (tag & TAG_MATRIXREF) {
+			int ref = import_int32(is);
+			if (ref >= is->matrix_n) {
+				luaL_error(is->alloc->L, "Invalid stream (%d): no martix ref %d", is->current_id, ref);
+			}
+			pp->t.mat = POINTER_TO_OFFSET(is->pack, &is->matrix[ref]);
 		} else {
-			pp->t.mat = NULL;
+			pp->t.mat = 0;
 		}
 		if (tag & TAG_COLOR) {
 			pp->t.color = import_color(is);
@@ -200,8 +241,6 @@ import_frame(struct pack_frame * pf, struct import_stream *is, int maxc) {
 		} else {
 			pp->touchable = 0;
 		}
-		// todo: support other program
-		pp->t.program = PROGRAM_DEFAULT;
 	}
 }
 
@@ -220,18 +259,20 @@ import_animation(struct import_stream *is) {
 		pa->component[i].name = import_string(is);
 	}
 	pa->action_number = import_word(is);
-	pa->action = (struct pack_action *)ialloc(is->alloc, SIZEOF_ACTION * pa->action_number);
+	struct pack_action * action = (struct pack_action *)ialloc(is->alloc, SIZEOF_ACTION * pa->action_number);
+	pa->action = POINTER_TO_OFFSET(is->pack, action);
 	int frame = 0;
 	for (i=0;i<pa->action_number;i++) {
-		pa->action[i].name = import_string(is);
-		pa->action[i].number = import_word(is);
-		pa->action[i].start_frame = frame;
-		frame += pa->action[i].number;
+		action[i].name = import_string(is);
+		action[i].number = import_word(is);
+		action[i].start_frame = frame;
+		frame += action[i].number;
 	}
 	pa->frame_number = import_word(is);
-	pa->frame = (struct pack_frame *)ialloc(is->alloc, SIZEOF_FRAME * pa->frame_number);
+	struct pack_frame * pf = (struct pack_frame *)ialloc(is->alloc, SIZEOF_FRAME * pa->frame_number);
+	pa->frame = POINTER_TO_OFFSET(is->pack, pf);
 	for (i=0;i<pa->frame_number;i++) {
-		import_frame(&pa->frame[i], is, component);
+		import_frame(&pf[i], is, component);
 	}
 }
 
@@ -244,7 +285,9 @@ import_label(struct import_stream *is) {
 	pl->width = import_word(is);
 	pl->height = import_word(is);
 	pl->edge = import_byte(is);
-	pl->max_width = import_word(is);
+    pl->space_w = import_byte(is);
+    pl->space_h = import_byte(is);
+    pl->auto_scale = import_byte(is);
 }
 
 static void
@@ -256,18 +299,40 @@ import_pannel(struct import_stream *is) {
 }
 
 static void
+import_matrix_chunk(struct import_stream *is) {
+	if (is->matrix)
+		luaL_error(is->alloc->L, "Invalid stream : only one matrix chunk support");
+	int n = import_int32(is);
+	is->matrix = (struct matrix *)ialloc(is->alloc, n * SIZEOF_MATRIX);
+	is->matrix_n = n;
+	int i,j;
+	for (i=0;i<n;i++) {
+		struct matrix *m = &is->matrix[i];
+		for (j=0;j<6;j++) {
+			m->m[j] = import_int32(is);
+		}
+	}
+}
+
+static void
 import_sprite(struct import_stream *is) {
 	int id = import_word(is);
+	int type = import_byte(is);
+	if (type == TYPE_MATRIX) {
+		import_matrix_chunk(is);
+		return;
+	}
 	if (id <0 || id >= is->pack->n) {
 		luaL_error(is->alloc->L, "Invalid stream : wrong id %d", id);
 	}
 	is->current_id = id;
-	int type = import_byte(is);
-	is->pack->type[id] = type;
-	if (is->pack->data[id]) {
+	uint8_t * type_array = OFFSET_TO_POINTER(uint8_t, is->pack, is->pack->type);
+	type_array[id] = type;
+	offset_t * data = OFFSET_TO_POINTER(offset_t, is->pack, is->pack->data);
+	if (data[id] != 0) {
 		luaL_error(is->alloc->L, "Invalid stream : duplicate id %d", id);
 	}
-	is->pack->data[id] = is->alloc->buffer;
+	data[id] = POINTER_TO_OFFSET(is->pack, is->alloc->buffer);
 	switch (type) {
 	case TYPE_PICTURE:
 		import_picture(is);
@@ -306,7 +371,9 @@ limport(lua_State *L) {
 	int size = (int)luaL_checkinteger(L, 3);
 	int tex;
 	int tt = lua_type(L,1);
-	if (tt == LUA_TNUMBER) {
+	if (tt == LUA_TNIL) {
+		tex = 0;
+	} else if (tt == LUA_TNUMBER) {
 		tex = 1;
 	} else {
 		if (tt != LUA_TTABLE) {
@@ -324,10 +391,12 @@ limport(lua_State *L) {
 	struct sprite_pack *pack = (struct sprite_pack *)ialloc(&alloc, SIZEOF_PACK + tex * sizeof(int));
 	pack->n = max_id + 1;
 	int align_n = (pack->n + 3) & ~3;
-	pack->type = (uint8_t *)ialloc(&alloc, align_n * sizeof(uint8_t));
-	memset(pack->type, 0, align_n * sizeof(uint8_t));
-	pack->data = (void **)ialloc(&alloc, pack->n * SIZEOF_POINTER);
-	memset(pack->data, 0, pack->n * SIZEOF_POINTER);
+	uint8_t * type = (uint8_t *)ialloc(&alloc, align_n * sizeof(uint8_t));
+	pack->type = POINTER_TO_OFFSET(pack, type);
+	memset(type, 0, align_n * sizeof(uint8_t));
+	offset_t *data = (offset_t *)ialloc(&alloc, pack->n * sizeof(offset_t));
+	pack->data = POINTER_TO_OFFSET(pack, data);
+	memset(data, 0, pack->n * sizeof(offset_t));
 
 	if (lua_istable(L,1)) {
 		int i;
@@ -336,14 +405,17 @@ limport(lua_State *L) {
 			pack->tex[i] = (int)luaL_checkinteger(L, -1);
 			lua_pop(L,1);
 		}
-	} else {
+	} else if (!lua_isnil(L,1)) {
 		pack->tex[0] = (int)lua_tointeger(L,1);
 	}
 
 	struct import_stream is;
 	is.alloc = &alloc;
 	is.pack = pack;
+	is.maxtexture = tex;
 	is.current_id = -1;
+	is.matrix = NULL;
+	is.matrix_n = 0;
 	if (lua_isstring(L,4)) {
 		is.stream = lua_tolstring(L, 4, &is.size);
 	} else {
@@ -361,9 +433,21 @@ limport(lua_State *L) {
 	return 1;
 }
 
+#endif // EXPORT_EP
+
+static int32_t
+readinteger(lua_State *L, int idx) {
+	if (lua_isinteger(L, idx)) {
+		return (int32_t)lua_tointeger(L, idx);
+	} else {
+		lua_Number n = luaL_checknumber(L, idx);
+		return (int32_t)n;
+	}
+}
+
 static int
 lpackbyte(lua_State *L) {
-	int n = (int)luaL_checkinteger(L, 1);
+	int n = (int)readinteger(L, 1);
 	if (n < 0 || n > 255) {
 		return luaL_error(L, "pack byte %d", n);
 	}
@@ -374,7 +458,7 @@ lpackbyte(lua_State *L) {
 
 static int
 lpackword(lua_State *L) {
-	int n = (int)luaL_checkinteger(L, 1);
+	int n = (int)readinteger(L, 1);
 	if (n < 0 || n > 0xffff) {
 		return luaL_error(L, "pack word %d", n);
 	}
@@ -388,7 +472,7 @@ lpackword(lua_State *L) {
 
 static int
 lpackint32(lua_State *L) {
-	int32_t sn = (int32_t)luaL_checkinteger(L, 1);
+	int32_t sn = (int32_t)readinteger(L, 1);
 	uint32_t n = (uint32_t) sn;
 	uint8_t buf[4] = {
 		(uint8_t)n&0xff ,
@@ -402,7 +486,7 @@ lpackint32(lua_State *L) {
 
 static int
 lpackcolor(lua_State *L) {
-	uint32_t n = luaL_checkunsigned(L,1);
+	uint32_t n = luaL_checkinteger(L,1);
 
 	uint8_t buf[4] = {
 		(uint8_t)n&0xff ,
@@ -455,7 +539,9 @@ lpackframetag(lua_State *L) {
 		case 't':
 			tag |= TAG_TOUCH;
 			break;
-
+		case 'M':
+			tag |= TAG_MATRIXREF;
+			break;
 		default:
 			return luaL_error(L, "Invalid tag %s", tagstr);
 			break;
@@ -492,7 +578,7 @@ lpack_size(lua_State *L) {
 	int align_n = (max_id + 1 + 3) & ~3;
 	int size = SIZEOF_PACK
 		+ align_n * sizeof(uint8_t)
-		+ (max_id+1) * SIZEOF_POINTER
+		+ (max_id+1) * sizeof(offset_t)
 		+ tex * sizeof(int);
 
 	lua_pushinteger(L, size);
@@ -525,10 +611,10 @@ lanimation_size(lua_State *L) {
 static int
 lpart_size(lua_State *L) {
 	int size;
-	if (lua_isnoneornil(L,1)) {
-		size = SIZEOF_PART;
-	} else {
+	if (lua_istable(L,1)) {
 		size = SIZEOF_PART + SIZEOF_MATRIX;
+	} else {
+		size = SIZEOF_PART;
 	}
 	lua_pushinteger(L, size);
 
@@ -561,20 +647,24 @@ lpannel_size(lua_State *L) {
 	return 1;
 }
 
+#ifndef EXPORT_EP
+
 void
 dump_pack(struct sprite_pack *pack) {
 	if (pack == NULL)
 		return;
 	int i;
+	uint8_t *type = OFFSET_TO_POINTER(uint8_t, pack, pack->type);
+	offset_t *data = OFFSET_TO_POINTER(offset_t, pack, pack->data);
 	for (i=0;i<pack->n;i++) {
-		if (pack->type[i] == TYPE_PICTURE)
+		if (type[i] == TYPE_PICTURE)
 			printf("%d : PICTURE\n", i);
 		else {
-			struct pack_animation *ani = (struct pack_animation *)pack->data[i];
+			struct pack_animation *ani = OFFSET_TO_POINTER(struct pack_animation, pack, data[i]);
 			printf("%d : ANIMATION %d\n", i, ani->component_number);
 			int i;
 			for (i=0;i<ani->component_number;i++) {
-				printf("\t%d %s\n",ani->component[i].id, ani->component[i].name ? ani->component[i].name : "");
+				printf("\t%d %s\n",ani->component[i].id, ani->component[i].name ? OFFSET_TO_STRING(pack, ani->component[i].name) : "");
 			}
 		}
 	}
@@ -612,7 +702,7 @@ limport_value(lua_State *L) {
 			| data[off+1] << 8
 			| data[off+2] << 16
 			| data[off+3] << 24;
-		lua_pushunsigned(L, v);
+		lua_pushinteger(L, v);
 		break;
 	}
 	case 's': {
@@ -644,6 +734,8 @@ limport_value(lua_State *L) {
 	return 2;
 }
 
+#endif // EXPORT_EP
+
 int
 ejoy2d_spritepack(lua_State *L) {
 	luaL_Reg l[] = {
@@ -661,9 +753,11 @@ ejoy2d_spritepack(lua_State *L) {
 		{ "string_size" , lstring_size },
 		{ "label_size", llabel_size },
 		{ "pannel_size", lpannel_size },
+#ifndef EXPORT_EP
 		{ "import", limport },
 		{ "import_value", limport_value },
 		{ "dump", ldumppack },
+#endif // EXPORT_EP
 		{ NULL, NULL },
 	};
 
@@ -679,6 +773,8 @@ ejoy2d_spritepack(lua_State *L) {
 	lua_setfield(L, -2, "TYPE_LABEL");
 	lua_pushinteger(L, TYPE_PANNEL);
 	lua_setfield(L, -2, "TYPE_PANNEL");
+	lua_pushinteger(L, TYPE_MATRIX);
+	lua_setfield(L, -2, "TYPE_MATRIX");
 
 	return 1;
 }

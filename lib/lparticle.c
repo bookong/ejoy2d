@@ -39,8 +39,8 @@ _init_from_table(struct particle_config *ps, struct lua_State *L) {
 	ps->duration = dict_float(L, "duration");
 
 	// avoid defined blend func
-	// int blendfunc_src = dict_float(L, "blendFuncSource");
-	// int blendfunc_dst = dict_float(L, "blendFuncDestination");
+	ps->srcBlend = dict_float(L, "blendFuncSource");
+	ps->dstBlend = dict_float(L, "blendFuncDestination");
 
 	ps->startColor.r = dict_float(L, "startColorRed");
 	ps->startColor.g = dict_float(L, "startColorGreen");
@@ -98,7 +98,7 @@ _init_from_table(struct particle_config *ps, struct lua_State *L) {
 		ps->mode.B.startRadius = dict_float(L, "maxRadius");
 		ps->mode.B.startRadiusVar = dict_float(L, "maxRadiusVariance");
 		ps->mode.B.endRadius = dict_float(L, "minRadius");
-		ps->mode.B.endRadiusVar = 0.0f;
+		ps->mode.B.endRadiusVar = dict_float(L, "minRadiusVariance");
 		ps->mode.B.rotatePerSecond = dict_float(L, "rotatePerSecond");
 		ps->mode.B.rotatePerSecondVar = dict_float(L, "rotatePerSecondVariance");
 	} else {
@@ -151,19 +151,44 @@ lupdate(lua_State *L) {
 	luaL_checktype(L,1,LUA_TUSERDATA);
 	struct particle_system *ps = (struct particle_system *)lua_touserdata(L, 1);
 	float dt = luaL_checknumber(L,2);
+	struct matrix *anchor = (struct matrix*)lua_touserdata(L, 3);
+	int edge = luaL_checkinteger(L, 4);
 
-	if (ps->config->positionType == POSITION_TYPE_GROUPED) {
+/*	if (ps->config->positionType == POSITION_TYPE_GROUPED) {
 		struct matrix *m = (struct matrix *)lua_touserdata(L, 3);
 		ps->config->sourcePosition.x = m->m[4] / SCREEN_SCALE;
 		ps->config->sourcePosition.y = m->m[5] / SCREEN_SCALE;
 	} else {
 		ps->config->sourcePosition.x = 0;
 		ps->config->sourcePosition.y = 0;
-	}
+	}*/
 
+	if (ps->config->positionType == POSITION_TYPE_GROUPED) {
+		ps->config->emitterMatrix = anchor;
+	} else {
+		ps->config->emitterMatrix = NULL;
+	}
+	ps->config->sourcePosition.x = 0;
+	ps->config->sourcePosition.y = 0;
 	particle_system_update(ps, dt);
 
-	lua_pushboolean(L, ps->isActive || ps->isAlive);
+	if (ps->isActive || ps->isAlive) {
+		lua_pushboolean(L, 1);
+		int n = ps->particleCount;
+		int i;
+		struct matrix tmp;
+		for (i=0;i<n;i++) {
+			struct particle *p = &ps->particles[i];
+			calc_particle_system_mat(p,&ps->matrix[i], edge);
+			if (ps->config->positionType != POSITION_TYPE_GROUPED) {
+				memcpy(tmp.m, &ps->matrix[i], sizeof(int) * 6);
+				matrix_mul(&ps->matrix[i], &tmp, anchor);
+			}
+			p->color_val = color4f(&p->color);
+		}
+	} else {
+		lua_pushboolean(L, 0);
+	}
 	return 1;
 }
 
@@ -184,7 +209,7 @@ ldata(lua_State *L) {
 		lua_rawseti(L, 2, i+1);
 
 		uint32_t c = color4f(&p->color);
-		lua_pushunsigned(L, c);
+		lua_pushinteger(L, c);
 		lua_rawseti(L, 3, i+1);
 	}
 
